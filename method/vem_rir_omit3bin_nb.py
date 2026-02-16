@@ -23,6 +23,7 @@ class VEM:
         eda_factor_ErrVar,
         sr=16000,
         smooth_pre: int = 0,
+        errvar_window: int = 0,
         *args,
         **kwargs
     ):
@@ -40,6 +41,7 @@ class VEM:
         self.patience = 5
         self.sr = sr
         self.smooth_pre = smooth_pre
+        self.errvar_window = errvar_window
 
         self.E_step_f_t_para = vmap(self.E_step_f_t)
         self.E_step_f_para = vmap(self.E_step_f)
@@ -116,7 +118,7 @@ class VEM:
         
         self.sinesweep = pad(torch.from_numpy(sinesweep).float(),(512,512))
         
-        sf.write('/mnt/inspurfs/home/wangpengyu/VINP-final/sinesweep.wav', self.sinesweep.numpy().squeeze(), self.sr)
+        # sf.write('/mnt/inspurfs/home/wangpengyu/VINP-final/sinesweep.wav', self.sinesweep.numpy().squeeze(), self.sr)
         # exit()
         
         self.invfilter = pad(torch.from_numpy(invfilter).float(),(512,512))
@@ -139,7 +141,7 @@ class VEM:
             Sig_var: [F,T] real 干净语音先验方差
             Noi_var: [F,T] real 噪声先验方差
             CTF: [F,L] complex CTF滤波器
-            Err_var: [F] real 误差方差
+            Err_var: [F] real (stationary) or [F,T] real (windowed) 误差方差
         """
 
         Obs = rev_spec  # [F,T] complex
@@ -169,7 +171,10 @@ class VEM:
 
         MIN_OBS_VAR, _ = Obs.abs().pow(2).min(1)
 
-        Err_var = (MIN_OBS_VAR * self.errvar_init).clamp(1e-16)
+        Err_var = (MIN_OBS_VAR * self.errvar_init).clamp(1e-16)  # [F]
+        if self.errvar_window > 0:
+            # Expand to [F, T] for time-varying noise estimation
+            Err_var = Err_var.unsqueeze(1).expand(-1, T).contiguous()
         # Err_var = (Obs.abs() ** 2).mean(1).clamp(1e-16)
 
         Mu = torch.zeros([F, T], device=self.device, dtype=self.dtype)
@@ -331,7 +336,7 @@ class VEM:
             Obs_f: [T] complex
             Sig_var_f: [T] real
             CTF_f: [L] complex
-            Err_var_f: [] real
+            Err_var_f: [] real (stationary) or [T] real (windowed)
             mu_f: [T] complex
             var_f: [T] real
         return:
@@ -343,7 +348,23 @@ class VEM:
         Obs_f_para = Obs_f.unfold(0, self.L, 1)  # [T,L] complex
         Sig_var_f_para = Sig_var_f  # [T] real
         CTF_f_para = CTF_f.unsqueeze(0).repeat(T, 1)  # [T,L] complex
-        Err_var_f_para = Err_var_f.unsqueeze(0).repeat(T) + NoiVar_f  # [T] real
+
+        if self.errvar_window > 0:
+            # Err_var_f is [T], combine with noise power
+            Err_var_f_combined = Err_var_f + NoiVar_f  # [T]
+            # Unfold to [T, L] — each time point gets noise variances for lags t..t+L-1
+            Err_var_f_padded = pad(
+                Err_var_f_combined.unsqueeze(0).unsqueeze(0),
+                (0, self.L - 1), mode='replicate'
+            ).squeeze(0).squeeze(0)  # [T + L - 1]
+            Err_var_f_unfolded = Err_var_f_padded.unfold(0, self.L, 1)  # [T, L]
+            # Flip to align with CTF ordering: CTF_f = [H_{L-1}, ..., H_0]
+            # so Err_var_f_para[t,:] = [delta(t+L-1), ..., delta(t)]
+            Err_var_f_para = Err_var_f_unfolded.flip(1)  # [T, L]
+        else:
+            # Original: broadcast scalar to [T]
+            Err_var_f_para = Err_var_f.unsqueeze(0).repeat(T) + NoiVar_f  # [T] real
+
         mu_f = pad(mu_f, (self.L - 1, self.L - 1))  # [T+2L-2]
         mu_f_para = mu_f.unfold(0, self.L * 2 - 1, 1)  # [T,2L-1] complex
 
@@ -367,7 +388,7 @@ class VEM:
             Obs_f_t [L] complex t:t+L-1
             Sig_var_f_t [] real
             CTF_f [L] complex from last iteration
-            Err_var_f_t [] real from last iteration
+            Err_var_f_t [] real (stationary) or [L] real (windowed, aligned with CTF ordering)
             mu_f_t [2L-1] complex t-L+1:t+L-1 from last iteration
             var_f_t [] real from last iteration
             MACs: 4L^2+6L+6
@@ -375,8 +396,11 @@ class VEM:
             mu_f_t [] complex
             var_f_t [] real
         """
+        # Posterior variance: element-wise multiply handles both scalar and [L] Err_var_f_t
+        # When scalar: Err_var^{-1} * sum(|H_l|^2) (original)
+        # When [L]: sum(Err_var_l^{-1} * |H_l|^2) (time-varying per lag)
         var_f_t = (
-            Sig_var_f_t.pow(-1) + Err_var_f_t.pow(-1) * CTF_f.abs().pow(2).sum()
+            Sig_var_f_t.pow(-1) + (Err_var_f_t.pow(-1) * CTF_f.abs().pow(2)).sum()
         ).real.pow(
             -1
         )  # m:L
@@ -390,8 +414,11 @@ class VEM:
         Mu_f_t = torch.stack(Mu_f_t, dim=1)
         Err_f_t = Obs_f_t - torch.matmul(CTF_f.unsqueeze(0), Mu_f_t).squeeze()
 
+        # Posterior mean: element-wise multiply handles both scalar and [L] Err_var_f_t
+        # When scalar: var * delta^{-1} * sum(H_l^* * E_l) (original)
+        # When [L]: var * sum(delta_l^{-1} * H_l^* * E_l) (time-varying per lag)
         mu_f_t = (
-            var_f_t * Err_var_f_t.pow(-1) * ((CTF_f.conj() * Err_f_t.flip(0)).sum())
+            var_f_t * ((Err_var_f_t.pow(-1) * CTF_f.conj() * Err_f_t.flip(0)).sum())
         )
 
         return mu_f_t, var_f_t, Err_f_t[0]
@@ -462,8 +489,7 @@ class VEM:
             mu_f: [T] complex
             var_f: [T] real
         return:
-            CTF_f_ret: [L] complex
-            Err_var_f_ret: [] real
+            Err_var_f_ret: [] real (stationary) or [T] real (windowed)
         Number of multiplications: T(12L+1)
         Number of addition: T(7L+2)
         """
@@ -479,7 +505,20 @@ class VEM:
             Obs_f_para, CTF_f_para, mu_f_para, var_f_para
         )  # m:T(12L+1) a:T(7L)
         Err_var_f_para = Err_var_f_para + NoiVar_f  # a:T
-        Err_var_f_ret = Err_var_f_para[self.L : -self.L].real.mean(0)  # a:T
+
+        if self.errvar_window > 0:
+            # Sliding window average -> [T] (time-varying noise variance)
+            W = self.errvar_window
+            half_w = W // 2
+            errors = Err_var_f_para.real  # [T]
+            # Replicate-pad for sliding window (pad needs 3D+ for replicate mode)
+            errors_3d = errors.unsqueeze(0).unsqueeze(0)  # [1, 1, T]
+            errors_padded = pad(errors_3d, (half_w, W - 1 - half_w), mode='replicate')
+            errors_padded = errors_padded.squeeze(0).squeeze(0)  # [T + W - 1]
+            Err_var_f_ret = errors_padded.unfold(0, W, 1).mean(1)  # [T]
+        else:
+            # Global mean -> scalar (original stationary behavior)
+            Err_var_f_ret = Err_var_f_para[self.L : -self.L].real.mean(0)  # a:T
 
         return Err_var_f_ret
 
@@ -574,7 +613,7 @@ class VEM:
             CTF_f: [L] complex
             Mu_f: [T] complex t-L:t
             Var_f: [T] real t-L:t
-            ErrVar_f: [] real
+            ErrVar_f: [] real (stationary) or [T] real (windowed)
         return:
             likeli_f: [] real
         """
@@ -582,7 +621,12 @@ class VEM:
         Obs_f_para = Obs_f  # [T] complex
 
         CTF_f_para = CTF_f.unsqueeze(0).repeat(T, 1)  # [T,L] complex
-        ErrVar_f_para = ErrVar_f.unsqueeze(0).repeat(T)
+        if self.errvar_window > 0:
+            # ErrVar_f is already [T] — one value per time frame
+            ErrVar_f_para = ErrVar_f  # [T]
+        else:
+            # Broadcast scalar to [T]
+            ErrVar_f_para = ErrVar_f.unsqueeze(0).repeat(T)
         Mu_f = pad(Mu_f, (self.L - 1, 0))  # [T+L-1]
         Mu_f_para = Mu_f.unfold(0, self.L, 1)  # [T,L] complex
         Var_f = pad(Var_f, (self.L - 1, 0),value=1e-16)  # [T+L-1]
