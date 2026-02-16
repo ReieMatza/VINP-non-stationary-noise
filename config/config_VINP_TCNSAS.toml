@@ -83,6 +83,7 @@ eda_factor_mu = 0.7
 eda_factor_var = 0.7
 eda_factor_CTF = 0.0
 eda_factor_ErrVar = 0.0
+errvar_window = 0
 
 [model.args]
 input_size = 257
