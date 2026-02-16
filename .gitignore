@@ -11,3 +11,12 @@ enhance_WPE.py
 /examples
 /method/review3.py
 /config/config_VINP_TCNSAS_review3.toml
+eval_results
+eval_results_baseline
+eval_results_original
+eval_results_windowed
+eval_results_windowed_all
+test_data
+test_data_clean
+test_data_nonstat
+test_data_white
