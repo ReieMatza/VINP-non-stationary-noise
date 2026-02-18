@@ -140,8 +140,10 @@ def evaluate_dataset(dataset_dir: str, model_subdir: str = "output_oSpatialNet")
     pesq_metric = PerceptualEvaluationSpeechQuality(SR, "wb")
 
     results = []
-    for est_path in samples:
+    n_samples = len(samples)
+    for idx, est_path in enumerate(samples):
         basename = os.path.basename(est_path)
+        print(f"  [{idx + 1}/{n_samples}] {basename}", flush=True)
         clean_path = os.path.join(clean_dir, basename)
         gt_rir_path = os.path.join(gt_rir_dir, basename)
         est_rir_path = os.path.join(est_rir_dir, basename)
@@ -390,15 +392,17 @@ def main():
                         help="Directory to save evaluation outputs")
     args = parser.parse_args()
 
+    print(f"VINP evaluation: {len(args.datasets)} dataset(s) -> {args.output_dir}/")
     os.makedirs(args.output_dir, exist_ok=True)
 
     all_results = {}
     summaries = []
+    n_datasets = len(args.datasets)
 
-    for label, path in args.datasets:
-        print(f"\nEvaluating [{label}] from {path} ...")
+    for d_idx, (label, path) in enumerate(args.datasets):
+        print(f"\n--- Dataset {d_idx + 1}/{n_datasets}: [{label}] from {path} ---")
         results = evaluate_dataset(path, args.model_subdir)
-        print(f"  {len(results)} samples evaluated")
+        print(f"  Done: {len(results)} samples evaluated for [{label}]")
         all_results[label] = results
 
         print_table(results, f"Per-Sample Results: {label}")

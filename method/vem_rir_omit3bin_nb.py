@@ -267,7 +267,7 @@ class VEM:
                 (1 - self.eda_factor_var) * Var + self.eda_factor_var * Var_old
             ).clamp(1e-16)
 
-            CTF = self.M_step_f_CTF_para(Obs, CTF, Mu, Var)
+            CTF = self.M_step_f_CTF_para(Obs, CTF, Mu, Var, Err_var)
             CTF = (1 - self.eda_factor_CTF) * CTF + self.eda_factor_CTF * CTF_old
 
             Err_var = self.M_step_f_ErrVar_para(Obs, CTF, Mu, Var, Noise_power)
@@ -523,17 +523,17 @@ class VEM:
         return Err_var_f_ret
 
     @torch.no_grad()
-    def M_step_f_CTF(self, Obs_f, CTF_f, mu_f, var_f, *args, **kwargs):
+    def M_step_f_CTF(self, Obs_f, CTF_f, mu_f, var_f, Err_var_f, *args, **kwargs):
         """
-        对每个频带估计CTF和噪声方差
+        对每个频带估计CTF滤波器
         input:
             Obs_f: [T] complex
             CTF_f: [L] complex
             mu_f: [T] complex
             var_f: [T] real
+            Err_var_f: [] real (stationary) or [T] real (windowed)
         return:
             CTF_f_ret: [L] complex
-            Err_var_f_ret: [] real
         Number of multiplications: 16/3L^3+(4T+4)L^2+4TL
         Number of addition: 2L^3+(2T+2)L^2+4T+3L
         """
@@ -552,8 +552,16 @@ class VEM:
         CTF_f_PartA_para = CTF_f_PartA_para[self.L : -self.L]
         CTF_f_PartB_para = CTF_f_PartB_para[self.L : -self.L]
 
-        CTF_f_PartA = CTF_f_PartA_para.mean(0)  # a:2T
-        CTF_f_PartB = CTF_f_PartB_para.mean(0)  # a:2T
+        if self.errvar_window > 0:
+            # Weight each frame by noise precision delta(f,t) = 1/Err_var(f,t)
+            # Frames with lower noise get higher weight in CTF estimation
+            weights = (1.0 / Err_var_f[self.L : -self.L]).unsqueeze(-1).unsqueeze(-1)  # [T', 1, 1]
+            CTF_f_PartA = (CTF_f_PartA_para * weights).mean(0)
+            CTF_f_PartB = (CTF_f_PartB_para * weights).mean(0)
+        else:
+            # Original: unweighted mean (delta cancels between PartA and PartB)
+            CTF_f_PartA = CTF_f_PartA_para.mean(0)  # a:2T
+            CTF_f_PartB = CTF_f_PartB_para.mean(0)  # a:2T
 
         CTF_f_ret = torch.matmul(
             CTF_f_PartB, torch.inverse(CTF_f_PartA+1e-5*torch.eye(self.L,device=self.device))
